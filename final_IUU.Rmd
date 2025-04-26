@@ -1,0 +1,82 @@
+---
+title: ""
+author: "chiara francesca ausenda"
+date: "2025-04-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Load libraries
+```{r}
+library(sf)
+library(tidyverse)
+library(lubridate)
+
+```
+
+#nearest EEZ code - (Welch et al., 2022) 
+```{r}
+
+# --- Load data ---
+master <- read.csv("~/GitHub/Ausenda-Wernick/GlobalFishingWatch-AIS-disabling-high-seas-814305b/data/disabling_events.csv")
+
+# Convert to sf object using longitude/latitude columns
+points_sf <- st_as_sf(master, coords = c("gap_start_lon", "gap_start_lat"), crs = 4326)
+
+valid_check1 <- st_is_valid(points_sf)
+all(valid_check1)
+points_sf <- st_make_valid(points_sf)
+
+# Load and validity low-res EEZ polygons
+eez_IUU <- st_read("~/GitHub/Ausenda-Wernick/World_EEZ_v12_20231025_LR/eez_v12_lowres.shp")
+
+valid_check2 <- st_is_valid(eez_IUU)
+all(valid_check2)
+eez_IUU <- st_make_valid(eez_IUU)
+
+# Join points to nearest EEZ polygon
+sf::sf_use_s2(FALSE)
+IUU_with_eez <- st_join(points_sf, eez_IUU, join = st_nearest_feature)
+
+# Extract just the EEZ name
+master$eez_country <- IUU_with_eez$ISO_SOV1
+
+```
+
+#formatting and wrangling
+```{r}
+#date formatting, select and filter
+# Define your countries
+selected_countries <- c("VEN", "COL", "ECU", "PER", "CHL", "ARG", 
+                        "URY", "BRA", "GUY", "SUR", "FRA")
+
+# Manipulate the data
+master_clean <- master %>%
+  mutate(date = format(ymd_hms(gap_end_timestamp), "%Y-%m")) %>%  # convert to YYYY-mm
+  select(gap_id, date, eez_country) %>%
+  filter(eez_country %in% selected_countries)
+
+```
+
+#counting vessels
+```{r}
+IUU_count <- master_clean %>%
+  count(eez_country, date, name = "IUU_EventsCount") %>%
+  complete(eez_country, date, fill = list(EventsCount = 0))  # fills in missing combos with 0
+
+```
+
+#joining with count_ym_anom and saving final_df
+```{r}
+# load piracy-anom df
+count_ym_anom <- read.csv("~/GitHub/Ausenda-Wernick/count_ym_anom.csv")
+
+# Join the datasets by date and eez_country and keep all columns
+final_df <- left_join(count_ym_anom, IUU_count, by = c("eez_country", "date"))
+
+write.csv(final_df, "final_df.csv", row.names = FALSE)
+```
+

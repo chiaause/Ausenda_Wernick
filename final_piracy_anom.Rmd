@@ -1,0 +1,298 @@
+---
+title: "thesis_William_steps"
+author: "chiara francesca ausenda"
+date: "2025-03-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+###Library load
+```{r}
+library(tidyverse)
+library(sf)
+library(RNetCDF)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(rmapshaper)
+```
+
+
+## Step 1 - Get EEZ polygons
+okay so basically the problem is with the high seas area. I need to plot both the bounding box and the eez thing to see if ACTUALLY there is an high seas area at all or it's all good-> tried lines 60-65 but i don't think it's the correct code-> check that and then try to solve.
+```{r}
+# Read EEZ Geopackage file
+eez_sf <- st_read("~/GitHub/Ausenda-Wernick/World_EEZ_v12_20231025_LR/eez_v12_lowres.shp")
+
+# Ensure no use of spherical geometry for validity checks
+sf_use_s2(FALSE)
+
+# Validity check for EEZ polygons
+#valid_check <- st_is_valid(eez_sf)
+#all(valid_check)
+
+# NOT NEEDED - Fix any invalid geometries in EEZ
+#eez_sf <- st_make_valid(eez_sf)
+
+# Drop the specified columns
+eez_sf <- eez_sf %>%
+  select(-c(TERRITORY1, MRGID_TER1, UN_TER1, MRGID_SOV1, UN_SOV1, 
+            AREA_KM2, MRGID_TER2, MRGID_TER3, MRGID_SOV2, MRGID_SOV3, 
+            UN_TER2, UN_TER3, UN_SOV2, UN_SOV3))
+
+# Define bounding box based on new coordinates for EEZ
+lon_min <- -95.3388  # westernmost longitude (Ecuador - Galapagos Islands EEZ)
+lon_max <- -25.294   # easternmost longitude (Brazil - Trindade Islands EEZ)
+lat_min <- -59.8527  # southernmost latitude (Chile EEZ)
+lat_max <- 16.7469   # northernmost latitude (Venezuela EEZ)
+
+# Create bounding box polygon
+bbox_polygon <- st_sfc(st_polygon(list(matrix(c(lon_min, lat_min,
+                                                 lon_min, lat_max,
+                                                 lon_max, lat_max,
+                                                 lon_max, lat_min,
+                                                 lon_min, lat_min),
+                                               ncol = 2, byrow = TRUE))), crs = st_crs(eez_sf))
+
+#Perform intersection: retain only EEZ polygons within the bounding box (intersecting with the box)
+eez_sf_bbox <- st_intersection(eez_sf, bbox_polygon)
+
+#visualization:
+#ggplot(eez_sf_bbox) + geom_sf()
+
+```
+If I want high seas, but there's also land lol
+
+high_seas <- st_difference(bbox_polygon, st_union(eez_sf_bbox))
+ggplot(high_seas) + geom_sf()
+
+
+
+
+##Temperature Anomalies and data manipulation
+
+```{r}
+# Open dataset
+url_V5 <- 'https://www.ncei.noaa.gov/thredds/dodsC/noaa-global-temp-v5/NOAAGlobalTemp_v5.0.0_gridded_s188001_e202212_c20230108T133308.nc'
+data_V5 <- open.nc(url_V5)
+
+# Extract variables
+latitude <- var.get.nc(data_V5, 'lat')
+longitude <- var.get.nc(data_V5, 'lon')
+
+# Convert longitude from 0-360 to -180 to 180 if needed
+longitude_shifted <- ifelse(longitude > 180, longitude - 360, longitude)
+
+# Convert time to Date format (days since 1800-01-01)
+time <- var.get.nc(data_V5, "time")
+time_dates <- as.Date("1800-01-01") + time
+time_df <- data.frame(time_index = 1:length(time), date = time_dates)
+
+# Filter time range from 1990 to 2022
+time_df <- time_df %>% filter(year(date) >= 1990 & year(date) <= 2022)
+
+# Group by approx months (30-day bins) and extract anomalies
+monthly_avg <- time_df %>%
+  mutate(month_year = format(date, "%m-%Y")) %>%
+  group_by(month_year) %>%
+  summarise(time_index = list(time_index), .groups = 'drop')
+
+# Function to create a polygon from a central point (lon, lat)
+create_polygon <- function(lon, lat, res = 5) {
+  coords <- matrix(
+    c(lon - res/2, lat - res/2,  # Bottom-left
+      lon + res/2, lat - res/2,  # Bottom-right
+      lon + res/2, lat + res/2,  # Top-right
+      lon - res/2, lat + res/2,  # Top-left
+      lon - res/2, lat - res/2), # Closing the polygon
+    ncol = 2, byrow = TRUE
+  )
+  return(st_polygon(list(coords)))
+}
+
+# Initialize list to store results
+results_list <- list()
+
+# Loop through each month-year group to extract and average anomaly values
+for (i in seq_len(nrow(monthly_avg))) {
+  indices <- unlist(monthly_avg$time_index[i])
+  anom_values <- sapply(indices, function(idx) var.get.nc(data_V5, 'anom', start=c(NA, NA, 1, idx), count=c(NA,NA,1,1)))
+  
+  # Compute average anomaly for the month
+  avg_anom <- rowMeans(anom_values, na.rm = TRUE)
+  
+  # Create spatial dataframe
+  df <- expand.grid(lon = longitude_shifted, lat = latitude)
+  df$anom <- as.vector(avg_anom)
+  df$date <- monthly_avg$month_year[i]
+  df$geometry <- mapply(create_polygon, df$lon, df$lat, SIMPLIFY = FALSE)
+  
+  # Subset the dataframe based on bounding box
+  df <- df %>% filter(lon >= lon_min & lon <= lon_max & lat >= lat_min & lat <= lat_max)
+  
+  # Store in list
+  results_list[[i]] <- df
+}
+
+# Combine all results into a single sf object
+t_anom_sf <- do.call(rbind, results_list) %>% st_as_sf(crs = 4326)
+
+# Print first few rows
+#print(head(t_anom_sf))
+
+```
+
+##Spatial join t_anom_sf in eez_sf_bbox
+```{r}
+# Perform spatial join: Assign anomalies from t_anom_sf to EEZ polygons
+sf_use_s2(FALSE)
+eez_t_anom <- st_join(t_anom_sf, eez_sf_bbox, left = TRUE)  # Keep all EEZ polygons
+
+# Group by EEZ and date, then compute the average anomaly
+eez_anom <- eez_t_anom %>%
+  group_by(MRGID_EEZ, date) %>%  # MRGID_EEZ uniquely identifies EEZs
+  summarise(avg_anom = mean(anom, na.rm = TRUE), .groups = 'drop')
+
+# Merge anomaly data back into EEZ polygons
+eez_t_final <- st_join(eez_sf, eez_anom, by = "MRGID_EEZ")
+
+# Print first few rows
+print(head(eez_t_final))
+```
+
+#Formatting eez_t_final
+```{r}
+selected_countries <- c("VEN", "COL", "ECU", "PER", "CHL", "ARG", 
+                        "URY", "BRA", "GUY", "SUR", "FRA")
+
+eez_t_final <- eez_t_final %>% 
+  filter(ISO_SOV1 %in% selected_countries) %>% 
+  select(c(ISO_SOV1, date, avg_anom)) %>% 
+  rename(eez_country = ISO_SOV1) %>% 
+  mutate(date = format(dmy(paste("01-", date, sep="")), "%Y-%m"))  # Convert MM-YYYY to YYYY-MM
+
+eez_t_final <- st_drop_geometry(eez_t_final)
+
+eez_t_final <- eez_t_final %>%
+  group_by(date, eez_country) %>%
+  summarize(avg_anom = mean(avg_anom, na.rm = TRUE), .groups = "drop")
+
+print(head(eez_t_final))
+```
+
+
+##Transorfming and formatting piracy_df
+```{r}
+piracy_df <- read.csv("~/GitHub/Ausenda-Wernick/pirate_attacks.csv",
+                      header = TRUE, stringsAsFactors = FALSE)
+
+# Select countries
+selected_countries <- c("VEN", "COL", "ECU", "PER", "CHL", "ARG", 
+                        "URY", "BRA", "GUY", "SUR", "FRA")
+piracy_df <- piracy_df %>% 
+  filter(eez_country %in% selected_countries)
+
+# Convert date variable to Date format
+piracy_df$date <- as.Date(piracy_df$date, format = "%Y-%m-%d")
+
+# Create year-month column
+piracy_df <- piracy_df %>%
+  mutate(date = format(date, "%Y-%m"))
+
+complete_grid <- expand_grid(
+  date = unique(piracy_df$date),
+  eez_country = unique(piracy_df$eez_country)
+)
+
+piracy_count <- piracy_df %>%
+  group_by(date, eez_country) %>%
+  summarize(EventsCount = n(), .groups = "drop")
+
+piracy_count <- complete_grid %>%
+  left_join(piracy_count, by = c("date", "eez_country")) %>%
+  mutate(EventsCount = replace_na(EventsCount, 0))
+
+print(head(piracy_count))
+```
+##visualization
+
+# Convert piracy data into spatial object using longitude & latitude
+piracy_sf <- st_as_sf(piracy_df, coords = c("longitude", "latitude"), crs = 4326)
+
+# Ensure both layers have the same CRS
+piracy_sf <- st_transform(piracy_sf, crs = st_crs(t_anom_sf))
+
+
+# Summarize data by counting occurrences of each year
+piracy_summary <- piracy_df %>%
+  mutate(year = year(as.Date(paste0(year_month, "-01")))) %>%  # Extract year from year_month
+  count(year)  # Creates a new column 'n' with counts
+
+# Plot with years on x-axis
+ggplot(piracy_summary, aes(x = as.factor(year), y = n)) +
+  geom_bar(stat = "identity", fill = "blue", color = "black") +
+  labs(title = "Distribution of Piracy Events by Year", x = "Year", y = "Count") +
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+#Joining-> count_ym_anom
+```{r} 
+#join
+count_ym_anom <- full_join(piracy_count, eez_t_final, by = c("date", "eez_country")) %>% 
+  mutate(EventsCount = replace_na(EventsCount, 0))
+
+# Print result
+print(head(count_ym_anom))
+
+write.csv(count_ym_anom, "count_ym_anom.csv", row.names = FALSE)
+```
+
+
+```{r}
+count_ym_anom <- read.csv("~/GitHub/Ausenda-Wernick/count_ym_anom.csv")
+
+# Plot the data
+ggplot(count_ym_anom, aes(x = date, y = EventsCount)) +
+  geom_line() +  # This will create a line plot
+  geom_point() + # This will add points for each data point
+  labs(title = "Events Count over Time",
+       x = "Date",
+       y = "Events Count") +
+  theme_minimal()  # Optional: for a cleaner look
+
+#look at monthly trends
+count_ym_anom$date <- as.Date(paste0(count_ym_anom$date, "-01"))
+count_ym_anom$Month <- factor(month(count_ym_anom$date, label = TRUE), levels = month.abb)
+
+monthly_trend <- count_ym_anom %>%
+  group_by(Month) %>%
+  summarise(TotalEvents = sum(EventsCount, na.rm = TRUE))
+
+ggplot(monthly_trend, aes(x = Month, y = TotalEvents, group = 1)) +
+  geom_line(color = "steelblue", size = 1) +
+  geom_point(size = 2) +
+  labs(title = "Monthly Event Count Trend",
+       x = "Month",
+       y = "Total Events") +
+  theme_minimal()
+
+
+#look at yearly trends
+count_ym_anom$year <- factor(year(count_ym_anom$date))
+
+yearly_trend <- count_ym_anom %>%
+  group_by(year) %>%
+  summarise(TotalEvents = sum(EventsCount, na.rm = TRUE))
+
+ggplot(yearly_trend, aes(x = year, y = TotalEvents, group = 1)) +
+  geom_line(color = "steelblue", size = 1) +
+  geom_point(size = 2) +
+  labs(title = "Yearly Event Count Trend",
+       x = "Year",
+       y = "Total Events") +
+  theme_minimal()
+```
+

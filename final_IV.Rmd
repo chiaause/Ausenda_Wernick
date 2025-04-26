@@ -1,0 +1,463 @@
+---
+title: "alt_route_IV"
+author: "chiara francesca ausenda"
+date: "2025-04-07"
+output: html_document
+---
+
+```{r, include = F}
+knitr::opts_chunk$set(results = 'markup')
+```
+
+#Load libraries
+```{r}
+library(tidyverse)
+library(broom) 
+library(modelsummary) 
+library(knitr) 
+library(kableExtra)
+library(janitor) 
+library(estimatr)
+library(lubridate)
+library(zoo)
+library(pscl)  
+library(texreg)
+library(broom)
+library(kableExtra)
+library(sandwich)
+```
+
+#load data
+```{r}
+final_df <- read.csv("~/GitHub/Ausenda-Wernick/final_df.csv")
+
+final_df$date <- as.Date(paste0(final_df$date, "-01"))
+
+#F-statistics
+
+final_df <- final_df %>% 
+  filter(date >= as.Date("2017-01-01") & date <= as.Date("2019-12-31")) %>% 
+    mutate(IUU_EventsCount = ifelse(is.na(IUU_EventsCount), 0, IUU_EventsCount)) %>% 
+  mutate(
+    EventsCount_lag = lag(EventsCount, 6),
+  )
+  
+```
+
+#2SLS
+```{r, echo = TRUE, results = 'markup'}
+summary(lm(IUU_EventsCount ~ avg_anom, data = final_df))
+
+#iv model
+late_model <- estimatr::iv_robust(EventsCount ~ IUU_EventsCount | avg_anom, data = final_df)
+
+
+modelsummary::modelsummary(
+  list("normal_IV" = late_model),
+  stars = c('*' = .1, '**' = .05, '***' = .01),
+  statistic = 'conf.int',
+  coef_rename = c("(Intercept)" = "Constant", "net_use" = "Net use"),
+  fmt = 2,
+  model_titles = c("classic iv"),
+  )
+```
+
+```{r eval=FALSE, include=FALSE}
+#significant-> decent intrument even if low f stat
+linear1 <- lm(IUU_EventsCount ~ avg_anom, data=final_df)
+
+modelsummary::modelsummary(list("H2 linear model"=linear1),
+                           stars = c('*' = .1, '**' = .05, '***' = .01),
+                           statistic = 'conf.int',
+                           coef_rename = c("(Intercept)"="Constant",
+                                           "net_use" = "Net use"),
+                           fmt = 2)
+
+
+
+
+#no avg anom significance-> exogeneity of instrument
+linear2 <- lm(EventsCount ~ avg_anom + IUU_EventsCount, data=final_df)
+
+modelsummary::modelsummary(list("IV Checks"=linear2),
+                           stars = c('*' = .1, '**' = .05, '***' = .01),
+                           statistic = 'conf.int',
+                           coef_rename = c("(Intercept)"="Constant",
+                                           "net_use" = "Net use"),
+                           fmt = 2)
+
+
+
+```
+
+#zero-inflated model
+```{r}
+
+# Create a clean dataset with complete cases
+df_clean <- final_df %>% 
+  na.omit()
+
+# First-stage regression
+first_stage <- lm(IUU_EventsCount ~ avg_anom , data = df_clean)
+
+# Get predicted IUU and residuals
+df_clean$pred_IUU <- predict(first_stage)
+df_clean$resid_IUU <- resid(first_stage)
+
+# Now run the zero-inflated Poisson model
+zip_iv_model <- zeroinfl(EventsCount ~ pred_IUU + resid_IUU 
+                         | avg_anom ,
+                         data = df_clean,
+                         dist = "poisson")
+```
+
+#logged version
+```{r}
+final_df$log_EventsCount <- log(final_df$EventsCount+1)
+final_df$log_IUU_EventsCount <- log(final_df$IUU_EventsCount+1)
+
+log_model <- estimatr::iv_robust(log_EventsCount ~ log_IUU_EventsCount | avg_anom, data = final_df)
+
+
+modelsummary::modelsummary(list("log_IV"=log_model),
+                           stars = c('*' = .1, '**' = .05, '***' = .01),
+                           statistic = 'conf.int',
+                           coef_rename = c("(Intercept)"="Constant",
+                                           "net_use" = "Net use"),
+                           fmt = 2)
+```
+
+#aggregated model
+```{r}
+
+#QUARTER
+# Add a quarter column
+final_df <- final_df %>%
+  mutate(quarter = paste0(year(date), " Q", quarter(date)))
+
+# Aggregate by eez_country and quarter
+quarterly_df <- final_df %>%
+  group_by(eez_country, quarter) %>%
+  summarise(
+    EventsCount = sum(EventsCount, na.rm = TRUE),
+    IUU_EventsCount = sum(IUU_EventsCount),
+    avg_anom = mean(avg_anom, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+agg_late_model <- estimatr::iv_robust(EventsCount ~ IUU_EventsCount | avg_anom, data = quarterly_df)
+
+
+modelsummary::modelsummary(list("agg_IV"=agg_late_model),
+                           stars = c('*' = .1, '**' = .05, '***' = .01),
+                           statistic = 'conf.int',
+                           coef_rename = c("(Intercept)"="Constant",
+                                           "net_use" = "Net use"),
+                           fmt = 2,
+                           )
+```
+
+
+#YEAR-> IUU_eventscount intercept doesn't change so i dunno
+# Extract year
+final_df <- final_df %>%
+  mutate(year = year(date))
+
+# Aggregate by eez_country and year
+yearly_df <- final_df %>%
+  group_by(eez_country, year) %>%
+  summarise(
+    EventsCount = sum(EventsCount, na.rm = TRUE),
+    IUU_EventsCount = sum(IUU_EventsCount, na.rm = TRUE),
+    avg_anom = mean(avg_anom, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+y_agg_late_model <- estimatr::iv_robust(EventsCount ~ IUU_EventsCount | avg_anom, data = yearly_df)
+
+
+modelsummary::modelsummary(list("LATE"=y_agg_late_model),
+                           stars = c('*' = .1, '**' = .05, '***' = .01),
+                           statistic = 'conf.int',
+                           coef_rename = c("(Intercept)"="Constant",
+                                           "net_use" = "Net use"),
+                           fmt = 2)
+
+
+#lagged models
+```{r}
+## 1-MONTH LAG
+monthly_lagged_df<- final_df %>%
+  arrange(eez_country, date) %>%  # Ensure the data is sorted by country and date
+  mutate(
+    EventsCount_lag1 = lag(EventsCount, 2),  # Lagged dependent variable
+    IUU_EventsCount_lag1 = lag(IUU_EventsCount, 2)  # Lagged independent variable
+  )
+```
+
+```{r}
+#Normal IV
+
+monthly_lag_iv <- iv_robust(EventsCount_lag1 ~ IUU_EventsCount_lag1 | avg_anom, data = monthly_lagged_df)
+
+modelsummary::modelsummary(list("lag_IV"=monthly_lag_iv),
+                           stars = c('*' = .1, '**' = .05, '***' = .01),
+                           statistic = 'conf.int',
+                           coef_rename = c("(Intercept)"="Constant",
+                                           "net_use" = "Net use"),
+                           fmt = 2)
+
+```
+
+```{r}
+#lagged zero-inflated model
+
+# Create a clean dataset with complete cases
+lag_df_clean <- monthly_lagged_df %>% 
+  na.omit()
+
+# First-stage regression
+first_stage <- lm(IUU_EventsCount_lag1 ~ avg_anom , data = lag_df_clean)
+
+# Get predicted IUU and residuals
+lag_df_clean$pred_IUU <- predict(first_stage)
+lag_df_clean$resid_IUU <- resid(first_stage)
+
+# Now run the zero-inflated Poisson model
+lag_zip_iv_model <- zeroinfl(EventsCount_lag1 ~ pred_IUU + resid_IUU 
+                         | avg_anom ,
+                         data = lag_df_clean,
+                         dist = "poisson")
+```
+
+```{r}
+#lagged quarterly-aggregated iv
+# Lag the EventsCount and IUU_EventsCount by 1 quarter
+lag_quarterly_df <- quarterly_df %>%
+  arrange(eez_country, quarter) %>%  # Ensure data is sorted by country and quarter
+  mutate(
+    EventsCount_lag1 = lag(EventsCount, 1),  # Lag EventsCount by 1 quarter
+    IUU_EventsCount_lag1 = lag(IUU_EventsCount, 1)  # Lag IUU_EventsCount by 1 quarter
+  )
+
+agg_lag_late_model <- estimatr::iv_robust(EventsCount_lag1 ~ IUU_EventsCount_lag1 | avg_anom, data = lag_quarterly_df)
+
+
+modelsummary::modelsummary(list("lag_agg"=agg_lag_late_model),
+                           stars = c('*' = .1, '**' = .05, '***' = .01),
+                           statistic = 'conf.int',
+                           coef_rename = c("(Intercept)"="Constant",
+                                           "net_use" = "Net use"),
+                           fmt = 2)
+
+```
+
+#lag-log piracy
+```{r}
+monthly_lagged_log_df<- final_df %>%
+  arrange(eez_country, date) %>%  # Ensure the data is sorted by country and date
+  mutate(
+    log_EventsCount_lag1 = lag(log_EventsCount, 2),  # Lagged dependent variable
+    log_IUU_EventsCount_lag1 = lag(log_IUU_EventsCount, 2)  # Lagged independent variable
+  )
+
+monthly_lag_log_iv <- iv_robust(log_EventsCount_lag1 ~ log_IUU_EventsCount_lag1 | avg_anom, data = monthly_lagged_log_df)
+
+modelsummary::modelsummary(list("lag_log_IV"=monthly_lag_log_iv),
+                           stars = c('*' = .1, '**' = .05, '***' = .01),
+                           statistic = 'conf.int',
+                           coef_rename = c("(Intercept)"="Constant",
+                                           "net_use" = "Net use"),
+                           fmt = 2)
+```
+
+
+```{r}
+#Colombia
+colombia_df <- final_df %>% 
+  filter(eez_country == "COL")
+
+#iv model
+COL_LATE <- estimatr::iv_robust(EventsCount ~ IUU_EventsCount | avg_anom, data = colombia_df)
+
+
+modelsummary::modelsummary(
+  list("COL_normal_IV" = COL_LATE),
+  stars = c('*' = .1, '**' = .05, '***' = .01),
+  statistic = 'conf.int',
+  coef_rename = c("(Intercept)" = "Constant", "net_use" = "Net use"),
+  fmt = 2,
+  model_titles = c("classic iv")
+  )
+
+```
+
+#look at distribution
+colombia_df <- colombia_df %>%
+  mutate(year = year(date)) %>% 
+
+# Aggregate by eez_country and year
+yearly_col_df <- colombia_df %>%
+  group_by(year) %>%
+  summarise(
+    EventsCount = sum(EventsCount, na.rm = TRUE),
+    IUU_EventsCount = sum(IUU_EventsCount, na.rm = TRUE),
+    avg_anom = mean(avg_anom, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(ggplot(yearly_col_df, aes(x = factor(year), y = EventsCount)) +
+     geom_col(fill = "darkorange") +
+     labs(
+         title = "Yearly Distribution of EventsCount in Colombia EEZ",
+         x = "Year",
+         y = "Total EventsCount") +
+     theme_minimal())+
+     theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+#plots
+```{r eval=FALSE, include=FALSE}
+model_list <- list(late_model, log_model, agg_late_model, monthly_lag_iv, monthly_lag_log_iv, agg_lag_late_model)
+
+htmlreg(model_list, file = "model_comparison3.html", 
+         custom.coef.names = c("Intercept", "IUU_EventsCount", "log_IUU_EventsCount", "IUU_EventsCount_lag1", "log_IUU_EventsCount_lag1"),
+         stars = 1,
+         title = "Comparison of IV Models")
+
+
+
+#zip
+
+zip_coefficients <- summary(zip_iv_model)$coefficients
+count_coefficients <- zip_coefficients$count
+zero_coefficients <- zip_coefficients$zero
+
+poisson_table <- data.frame(
+  Predictor = rownames(count_coefficients),
+  Estimate = count_coefficients[, "Estimate"],
+  Std_Error = count_coefficients[, "Std. Error"],
+  Z_Value = count_coefficients[, "z value"],
+  P_Value = count_coefficients[, "Pr(>|z|)"]
+)
+
+zero_inflation_table <- data.frame(
+  Predictor = rownames(zero_coefficients),
+  Estimate = zero_coefficients[, "Estimate"],
+  Std_Error = zero_coefficients[, "Std. Error"],
+  Z_Value = zero_coefficients[, "z value"],
+  P_Value = zero_coefficients[, "Pr(>|z|)"]
+)
+
+combined_table <- merge(
+  poisson_table, 
+  zero_inflation_table, 
+  by = "Predictor", 
+  suffixes = c("_Poisson", "_ZeroInflation")
+)
+
+# Create a new column to identify the model type (Poisson or Zero-Inflation)
+poisson_table$Model <- "Poisson"
+zero_inflation_table$Model <- "Zero-Inflation"
+
+# Combine the two tables vertically
+combined_table <- rbind(poisson_table, zero_inflation_table)
+
+# Create the HTML table using kable
+combined_table_html <- combined_table %>%
+  kable("html", col.names = c("Predictor", "Estimate", "Std. Error", "Z Value", "P Value", "Model")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+# Save the table to an HTML file
+save_kable(combined_table_html, file = "zip_model_output.html")
+
+#lagged zip
+lag_zip_coefficients <- summary(lag_zip_iv_model)$coefficients
+lag_count_coefficients <- lag_zip_coefficients$count
+lag_zero_coefficients <- lag_zip_coefficients$zero
+
+lag_poisson_table <- data.frame(
+  Predictor = rownames(lag_count_coefficients),
+  Estimate = lag_count_coefficients[, "Estimate"],
+  Std_Error = lag_count_coefficients[, "Std. Error"],
+  Z_Value = lag_count_coefficients[, "z value"],
+  P_Value = lag_count_coefficients[, "Pr(>|z|)"]
+)
+
+lag_zero_inflation_table <- data.frame(
+  Predictor = rownames(lag_zero_coefficients),
+  Estimate = lag_zero_coefficients[, "Estimate"],
+  Std_Error = lag_zero_coefficients[, "Std. Error"],
+  Z_Value = lag_zero_coefficients[, "z value"],
+  P_Value = lag_zero_coefficients[, "Pr(>|z|)"]
+)
+
+lag_combined_table <- merge(
+  lag_poisson_table, 
+  lag_zero_inflation_table, 
+  by = "Predictor", 
+  suffixes = c("_Poisson", "_ZeroInflation")
+)
+
+# Create a new column to identify the model type (Poisson or Zero-Inflation)
+lag_poisson_table$Model <- "Poisson"
+lag_zero_inflation_table$Model <- "Zero-Inflation"
+
+# Combine the two tables vertically
+lag_combined_table <- rbind(lag_poisson_table, lag_zero_inflation_table)
+
+# Create the HTML table using kable
+lag_combined_table_html <- lag_combined_table %>%
+  kable("html", col.names = c("Predictor", "Estimate", "Std. Error", "Z Value", "P Value", "Model")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+# Save the table to an HTML file
+save_kable(lag_combined_table_html, file = "lag_zip_model_output.html")
+
+```
+
+
+
+# Use tidy() to extract the results from each model (exp zip)
+tidy_late_model <- tidy(late_model)
+tidy_agg_late_model <- tidy(agg_late_model)
+tidy_monthly_lag_iv <- tidy(monthly_lag_iv)
+tidy_agg_lag_late_model <- tidy(agg_lag_late_model)
+
+#spearate zip coefficients
+zip_coefficients <- summary(zip_iv_model)$coefficients
+zip_count_coefficients <- zip_coefficients$count
+zip_zero_coefficients <- zip_coefficients$zero
+
+lag_zip_coefficients <- summary(lag_zip_iv_model)$coefficients
+lag_zip_count_coefficients <- lag_zip_coefficients$count
+lag_zip_zero_coefficients <- lag_zip_coefficients$zero
+
+# Manually create a tidy data frame for the zeroinfl model
+zip_tidy <- data.frame(
+  term = c(rownames(zip_count_coefficients), rownames(zip_zero_coefficients)),
+  estimate = c(zip_count_coefficients[, 1], zip_zero_coefficients[, 1]),
+  std.error = c(zip_count_coefficients[, 2], zip_zero_coefficients[, 2]),
+  p.value = c(zip_count_coefficients[, 4], zip_zero_coefficients[, 4]),
+  model = rep("Zero-Inflated IV", length(c(rownames(zip_count_coefficients), rownames(zip_zero_coefficients))))
+)
+
+lag_zip_tidy <- data.frame(
+  term = c(rownames(lag_zip_count_coefficients), rownames(lag_zip_zero_coefficients)),
+  estimate = c(lag_zip_count_coefficients[, 1], lag_zip_zero_coefficients[, 1]),
+  std.error = c(lag_zip_count_coefficients[, 2], lag_zip_zero_coefficients[, 2]),
+  p.value = c(lag_zip_count_coefficients[, 4], lag_zip_zero_coefficients[, 4]),
+  model = rep("Lagged Zero-Inflated IV", length(c(rownames(lag_zip_count_coefficients), rownames(lag_zip_zero_coefficients))))
+)
+
+# Add model labels to the tidy results
+tidy_late_model$model <- "Normal IV"
+tidy_agg_late_model$model <- "Aggregated IV"
+tidy_monthly_lag_iv$model <- "Lagged IV"
+tidy_agg_lag_late_model$model <- "Lagged Aggregated"
+
+# Combine the tidy results into a single data frame
+combined_tidy_models <- rbind(tidy_late_model, tidy_agg_late_model, zip_tidy, 
+                              lag_zip_tidy, tidy_agg_lag_late_model, tidy_monthly_lag_iv)
+
+# Create a table and display it in markdown format
+kable(combined_tidy_models, format = "markdown", digits = 3)
